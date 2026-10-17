@@ -27,6 +27,18 @@ Parameters:
       Latest Amazon Linux 2023 AMI, resolved automatically from SSM.
       You never need to hardcode an AMI ID.
 
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: >
+      VPC to launch the gRPC server into. Use your default VPC for the POC.
+      The deploy workflow passes this from the account's default VPC.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: >
+      Public subnet for the EC2 instance (must be in VpcId and auto-assign public IP).
+
+
   LambdaS3BucketParam:
     Type: String
     Description: >
@@ -312,6 +324,7 @@ Resources:
     Properties:
       GroupName: !Sub "tc-server-sg-${Env}"
       GroupDescription: TellCartman gRPC server security group
+      VpcId: !Ref VpcId
       SecurityGroupIngress:
         # gRPC port: restricted to configured CIDR
         - IpProtocol: tcp
@@ -339,6 +352,7 @@ Resources:
       InstanceType: t3.micro
       ImageId: !Ref LatestAmiId
       IamInstanceProfile: !Ref ServerInstanceProfile
+      SubnetId: !Ref SubnetId
       SecurityGroupIds:
         - !Ref ServerSecurityGroup
       Tags:

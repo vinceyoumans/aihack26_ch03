@@ -114,9 +114,36 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ secrets.AWS_REGION }}
 
-      # Before deploying CF, we need a bucket to upload the Lambda zip to.
-      # We use a separate "bootstrap" bucket or the existing one if it exists.
-      # For the first deploy, create the bucket manually or via a separate step.
+      # If a prior deploy left the stack in ROLLBACK_COMPLETE, it can't be updated —
+      # it must be deleted first. This handles first-deploy failures cleanly.
+      - name: Delete rolled-back stack if present
+        run: |
+          STATUS=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --query "Stacks[0].StackStatus" --output text 2>/dev/null || echo "NONE")
+          echo "Current stack status: $STATUS"
+          if [ "$STATUS" = "ROLLBACK_COMPLETE" ] || [ "$STATUS" = "ROLLBACK_FAILED" ]; then
+            echo "Deleting unusable stack..."
+            aws cloudformation delete-stack --stack-name ${{ env.STACK_NAME }}
+            aws cloudformation wait stack-delete-complete --stack-name ${{ env.STACK_NAME }}
+            echo "Stack deleted."
+          fi
+
+      # Discover the default VPC and a public subnet so the EC2 instance has
+      # a network to launch into. Keeps the template portable (no hardcoded IDs).
+      - name: Discover default VPC and subnet
+        id: network
+        run: |
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters "Name=isDefault,Values=true" \
+            --query "Vpcs[0].VpcId" --output text)
+          SUBNET_ID=$(aws ec2 describe-subnets \
+            --filters "Name=vpc-id,Values=$VPC_ID" "Name=map-public-ip-on-launch,Values=true" \
+            --query "Subnets[0].SubnetId" --output text)
+          echo "vpc_id=$VPC_ID"       >> $GITHUB_OUTPUT
+          echo "subnet_id=$SUBNET_ID" >> $GITHUB_OUTPUT
+          echo "Using VPC $VPC_ID, subnet $SUBNET_ID"
+
       - name: Deploy CloudFormation stack
         run: |
           aws cloudformation deploy \
@@ -124,6 +151,8 @@ jobs:
             --template-file ${{ env.CF_TEMPLATE }} \
             --parameter-overrides \
               Env=${{ env.ENV }} \
+              VpcId=${{ steps.network.outputs.vpc_id }} \
+              SubnetId=${{ steps.network.outputs.subnet_id }} \
               LambdaS3BucketParam=tellcartman-raw-${{ env.ENV }}-${{ secrets.AWS_ACCOUNT_ID }} \
               LambdaS3KeyParam=binaries/lambda-writer.zip \
             --capabilities CAPABILITY_NAMED_IAM \
