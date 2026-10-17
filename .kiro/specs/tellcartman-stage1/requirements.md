@@ -4,6 +4,8 @@
 
 TellCartman is a patient monitoring platform designed to help health coaches detect rough patches in cancer treatment patients before they happen. Stage 1 establishes the data ingestion pipeline: structured patient telemetry is submitted from client devices over gRPC/protobuf, received by a cloud server, queued via SQS, and persisted to S3 every minute. An S3 event fires on each save, which Stage 2 will consume for analysis.
 
+> **Status note (2026-10-17):** This document now covers both Stage 1 (ingestion pipeline) and Stage 2 additions (server-side receive hardening, CloudFront media delivery, full CI/CD on the `deploydev` branch, multi-language SDKs). See `tasks.md` for live build status.
+
 ---
 
 ## Functional Requirements
@@ -90,6 +92,37 @@ The system SHALL:
 
 ---
 
+## Stage 2 Requirements (added 2026-10-17)
+
+### NEW-FR-10 — CloudFront Media Delivery
+The system SHALL:
+- Serve patient photos (`photos/*` prefix) via a CloudFront distribution over HTTPS
+- Use Origin Access Control (OAC, sigv4) so the S3 bucket remains fully private
+- Enforce HTTPS (redirect-to-https); no cleartext health data
+- Map S3 403 responses to 404 to avoid leaking object paths
+- Use PriceClass_100 (North America + Europe edges) for POC cost control
+
+### NEW-FR-11 — Multi-Language Client SDKs
+The system SHALL provide client SDKs generated from the single canonical proto:
+- **Kotlin SDK** (Android/JVM) — high-level `TellCartmanClient` with submitCheckIn, uploadPhoto, uploadAudio; coroutine-based
+- **Swift SDK** (iOS/macOS) — high-level `TellCartmanClient` with async/await API
+- Each SDK includes usage examples and unit tests
+- Go and Rust clients remain as defined in FR-02 and FR-03
+
+### NEW-FR-12 — deploydev Branch Deploy Pipeline
+The system SHALL:
+- Trigger the deploy workflow ONLY on pushes to the `deploydev` branch
+- Gate deploy on tests passing (build job runs `go test` before any AWS action)
+- Deploy sequence: build → deploy-infra (CloudFormation) → deploy-lambda → deploy-server (SSM RunCommand) → smoke test
+- Use a dedicated scoped IAM user (`tc-github-actions`), never personal/root credentials
+
+### NEW-FR-13 — Containerized Server Build
+The system SHALL provide a `Dockerfile` for the gRPC server:
+- Multi-stage build (Go builder → distroless runtime)
+- Non-root user, static binary, no shell in the runtime image
+
+---
+
 ## Non-Functional Requirements
 
 ### NFR-01 — Language and Runtime
@@ -128,12 +161,12 @@ The system SHALL:
 
 ---
 
-## Out of Scope for Stage 1
+## Out of Scope for Stage 1 & 2
 
-- AI/ML analysis of patient data
-- Web portal for health coaches
+- AI/ML analysis of patient data (Stage 3)
+- Web portal for health coaches (Stage 3)
 - Weather API integration (ambient data fields are in proto but populated by client from CSV)
-- Swift, Kotlin, Alexa, Siri clients
-- Stage 2 S3 event consumer
-- Authentication/authorization (JWT, mTLS) — stubbed, added in Stage 2
-- Video ingestion
+- Alexa, Siri clients (Kotlin + Swift SDKs are now IN scope — see NEW-FR-11)
+- Stage 3 S3 event consumer (SNS topic stub wired, consumer not implemented)
+- Authentication/authorization (JWT, mTLS) — stubbed, planned for Stage 3
+- Video ingestion (audio + photos only)
