@@ -1,0 +1,93 @@
+{{define "index.html"}}<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TellCartman — Demo Portal</title>
+  <!-- HTMX: the H in GoTH. Drives partial updates without writing JS. -->
+  <script src="https://unpkg.com/htmx.org@1.9.12" integrity="sha384-ujb1lZYygJmzgSwoxRggbCHcjc0rB2XoQrxeTUQyRjrOnlCoYta87iKBWq3EsdM2" crossorigin="anonymous"></script>
+  <style>
+    :root {
+      --good: #1a9850; --rough: #f46d43; --critical: #d73027;
+      --event: #8856a7; --checkin: #4575b4; --bg: #0f1419; --panel: #1a2029;
+      --text: #e6e6e6; --muted: #8a94a6; --border: #2a3340;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: var(--bg); color: var(--text); line-height: 1.4;
+    }
+    header {
+      padding: 16px 24px; background: var(--panel); border-bottom: 1px solid var(--border);
+      display: flex; align-items: baseline; gap: 16px;
+    }
+    header h1 { margin: 0; font-size: 20px; }
+    header .target { color: var(--muted); font-size: 13px; font-family: ui-monospace, monospace; }
+    .layout { display: grid; grid-template-columns: 1fr 360px; gap: 0; }
+    main { padding: 20px 24px; }
+    aside {
+      padding: 20px; background: var(--panel); border-left: 1px solid var(--border);
+      min-height: calc(100vh - 57px);
+    }
+    .patient {
+      background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+      padding: 16px; margin-bottom: 16px;
+    }
+    .patient h2 { margin: 0 0 4px; font-size: 16px; }
+    .patient .summary { color: var(--muted); font-size: 13px; margin-bottom: 12px; }
+    .events { display: flex; flex-wrap: wrap; gap: 8px; }
+    button.evt {
+      border: none; border-radius: 6px; padding: 7px 11px; font-size: 12px;
+      color: #fff; cursor: pointer; font-weight: 600; opacity: 0.92;
+    }
+    button.evt:hover { opacity: 1; }
+    .good { background: var(--good); } .rough { background: var(--rough); }
+    .critical { background: var(--critical); } .event { background: var(--event); }
+    .checkin { background: var(--checkin); }
+    aside h3 { margin: 0 0 12px; font-size: 14px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+    .hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>TellCartman</h1>
+    <span class="target">gRPC → {{.Target}}</span>
+  </header>
+
+  <div class="layout">
+    <main>
+      <p class="hint">Click an event below to act as that patient. Each click builds a protobuf
+        <code>PatientRecord</code> from the synthetic dataset and submits it over gRPC to the live
+        server, which flows through SQS → Lambda → S3. Synthetic data; nobody here is real.</p>
+
+      {{range .Patients}}
+      <div class="patient">
+        <h2>{{.DisplayName}} <span style="color:var(--muted);font-weight:400">({{.Sex}}, age {{.Age}})</span></h2>
+        <div class="summary">{{.Summary}}</div>
+        <div class="events">
+          {{$pid := .PatientID}}
+          {{range $i, $d := .Days}}
+          <button class="evt {{kindClass $d.Kind}}"
+                  hx-post="/send"
+                  hx-target="#feed"
+                  hx-swap="innerHTML"
+                  hx-vals='{"patient":"{{$pid}}","day":"{{$i}}"}'
+                  title="{{$d.Date}} — feeling {{$d.DailyFeeling}}/5{{if $d.Event}} — {{$d.Event}}{{end}}">
+            {{kindLabel $d.Kind}}{{if $d.DailyFeeling}} {{$d.DailyFeeling}}/5{{end}}
+          </button>
+          {{end}}
+        </div>
+      </div>
+      {{end}}
+    </main>
+
+    <aside>
+      <h3>Live feed — sent to gRPC</h3>
+      <!-- Poll every 3s as a fallback; also updated instantly on each click -->
+      <div id="feed" hx-get="/feed" hx-trigger="every 3s" hx-swap="innerHTML">
+        {{template "feed.html" .Feed}}
+      </div>
+    </aside>
+  </div>
+</body>
+</html>{{end}}

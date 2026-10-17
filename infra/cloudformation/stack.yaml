@@ -231,6 +231,17 @@ Resources:
               - Effect: Allow
                 Action: s3:GetObject
                 Resource: !Sub "${TellCartmanBucket.Arn}/binaries/*"
+              # Coach page: read aggregated patient records from raw/
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${TellCartmanBucket.Arn}/raw/*"
+              # Coach page: list objects to enumerate the raw/ prefix
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt TellCartmanBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix: "raw/*"
 
   ServerInstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -336,6 +347,11 @@ Resources:
           FromPort: 8080
           ToPort: 8080
           CidrIp: "0.0.0.0/0"
+        # Coach page (Stage 5) — read-only dashboard served from S3 data
+        - IpProtocol: tcp
+          FromPort: 8091
+          ToPort: 8091
+          CidrIp: "0.0.0.0/0"
         # NOTE: Port 22 (SSH) is intentionally omitted.
         # Use SSM Session Manager: aws ssm start-session --target <instance-id>
       SecurityGroupEgress:
@@ -417,6 +433,41 @@ Resources:
           # Only start if the binary exists; otherwise deploy-server starts it later
           [ -f /usr/local/bin/tc-server ] && systemctl start tc-server || \
             echo "deferring service start until binary is deployed"
+
+          # ── Coach page (Stage 5): second service reading from S3 ─────────────
+          aws s3 cp s3://${TellCartmanBucket}/binaries/coach /usr/local/bin/tc-coach || \
+            echo "coach binary not yet uploaded; deploy-server will install it"
+          [ -f /usr/local/bin/tc-coach ] && chmod +x /usr/local/bin/tc-coach || true
+
+          cat > /etc/tc-coach.env <<EOF
+          BUCKET_NAME=${TellCartmanBucket}
+          COACH_PORT=8091
+          ENV=${Env}
+          AWS_REGION=${AWS::Region}
+          EOF
+
+          cat > /etc/systemd/system/tc-coach.service <<EOF
+          [Unit]
+          Description=TellCartman Coach Page
+          After=network.target
+
+          [Service]
+          Type=simple
+          EnvironmentFile=/etc/tc-coach.env
+          ExecStart=/usr/local/bin/tc-coach
+          Restart=on-failure
+          RestartSec=5
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          systemctl daemon-reload
+          systemctl enable tc-coach
+          [ -f /usr/local/bin/tc-coach ] && systemctl start tc-coach || \
+            echo "deferring coach start until binary is deployed"
 
   # ── CloudFront: Distribution ───────────────────────────────────────────────
   # Serves photos/* from S3 over HTTPS via OAC (Origin Access Control).

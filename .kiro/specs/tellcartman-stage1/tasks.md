@@ -215,11 +215,18 @@ This section captures the Stage 2 work actually built on 2026-10-17.
 - ✅ `go test -race -count=1 ./...` — ALL PASS (server + lambda packages)
 - **Refs:** FR-09, NFR-02
 
-### ⬜ Task S2.10 — First Successful AWS Deploy
-- After S2.9 is green, push to `deploydev`
-- Verify: CloudFormation stack `tellcartman-dev` CREATE_COMPLETE
-- Verify: EC2 running, Lambda active, S3 bucket + CloudFront created
-- Verify: smoke test (HTTP /health 200) passes in the pipeline
+### ✅ Task S2.10 — First Successful AWS Deploy (DONE 2026-10-17)
+- Deploy pipeline fully GREEN: Build ✓ · Deploy Infrastructure ✓ · Deploy Lambda ✓ · Deploy Server ✓
+- CloudFormation stack `tellcartman-dev`: CREATE_COMPLETE (17 resources, 0 failures)
+- EC2 gRPC server running @ 18.218.64.156 (t3.micro)
+- Lambda `tc-writer-dev` Active (provided.al2023)
+- SQS→Lambda event source Enabled, 60s batch window (the "1 file per minute" path)
+- CloudFront: d108fom70rza41.cloudfront.net
+- Smoke test passed: HTTP /health returned 200
+- Fixes applied to get here: GitHub env (aiHack-dev), IAM policy expanded
+  (changeset, ssm:GetParameters, full S3 config, event-source-mapping, DeleteStack,
+  artifacts bucket), VpcId/SubnetId params, Lambda zip bootstrap via artifacts
+  bucket, resilient EC2 UserData, deploy-server self-resolves targets
 - **Refs:** FR-09
 
 ---

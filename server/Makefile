@@ -110,3 +110,65 @@ upload-lambda: build-lambda
 		--s3-bucket $(BUCKET_NAME) \
 		--s3-key binaries/lambda-writer.zip
 	@echo "✓ Lambda updated"
+
+# ── Teardown ──────────────────────────────────────────────────────────────────
+# Tears down the entire dev stack. S3 buckets must be emptied first because
+# CloudFormation refuses to delete non-empty buckets.
+#
+# Usage:
+#   make destroy ENV=dev ACCOUNT_ID=483199420446 REGION=us-east-2
+#
+# This is DESTRUCTIVE and irreversible. It deletes all patient data in S3,
+# the EC2 server, Lambda, SQS queues, SNS topic, and CloudFront distribution.
+.PHONY: destroy
+destroy:
+	@[ -n "$(ENV)" ]        || (echo "ENV not set (e.g. ENV=dev)" && exit 1)
+	@[ -n "$(ACCOUNT_ID)" ] || (echo "ACCOUNT_ID not set" && exit 1)
+	@[ -n "$(REGION)" ]     || (echo "REGION not set (e.g. REGION=us-east-2)" && exit 1)
+	@echo "⚠️  This will DELETE the entire tellcartman-$(ENV) stack and all data."
+	@echo "    Data bucket:      tellcartman-raw-$(ENV)-$(ACCOUNT_ID)"
+	@echo "    Artifacts bucket: tc-artifacts-$(ENV)-$(ACCOUNT_ID)"
+	@printf "    Type the env name to confirm [$(ENV)]: " && read confirm && [ "$$confirm" = "$(ENV)" ] || (echo "Aborted." && exit 1)
+	@echo "→ Emptying data bucket (all versions)..."
+	-aws s3 rm s3://tellcartman-raw-$(ENV)-$(ACCOUNT_ID) --recursive --region $(REGION)
+	-@$(MAKE) _purge-versions BUCKET=tellcartman-raw-$(ENV)-$(ACCOUNT_ID) REGION=$(REGION)
+	@echo "→ Emptying artifacts bucket..."
+	-aws s3 rm s3://tc-artifacts-$(ENV)-$(ACCOUNT_ID) --recursive --region $(REGION)
+	@echo "→ Deleting CloudFormation stack (this also removes the data bucket, EC2, Lambda, CloudFront)..."
+	aws cloudformation delete-stack --stack-name tellcartman-$(ENV) --region $(REGION)
+	aws cloudformation wait stack-delete-complete --stack-name tellcartman-$(ENV) --region $(REGION)
+	@echo "→ Deleting artifacts bucket (not managed by CloudFormation)..."
+	-aws s3api delete-bucket --bucket tc-artifacts-$(ENV)-$(ACCOUNT_ID) --region $(REGION)
+	@echo "✓ Teardown complete. All tellcartman-$(ENV) resources removed."
+
+# Internal: purge all object versions + delete markers from a versioned bucket.
+# S3 versioning keeps old versions even after `s3 rm`, which blocks bucket deletion.
+.PHONY: _purge-versions
+_purge-versions:
+	@echo "  purging object versions from $(BUCKET)..."
+	-@aws s3api list-object-versions --bucket $(BUCKET) --region $(REGION) \
+		--query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' --output json 2>/dev/null \
+		| aws s3api delete-objects --bucket $(BUCKET) --region $(REGION) --delete file:///dev/stdin 2>/dev/null || true
+	-@aws s3api list-object-versions --bucket $(BUCKET) --region $(REGION) \
+		--query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' --output json 2>/dev/null \
+		| aws s3api delete-objects --bucket $(BUCKET) --region $(REGION) --delete file:///dev/stdin 2>/dev/null || true
+
+# ── Stop / Start EC2 (cheaper than full teardown) ────────────────────────────
+# Stops the EC2 instance to save ~$7.50/mo while keeping everything else.
+# The instance keeps its config; start it again when you need it.
+#
+# Usage:
+#   make stop-server  ENV=dev REGION=us-east-2
+#   make start-server ENV=dev REGION=us-east-2
+.PHONY: stop-server start-server
+stop-server:
+	@[ -n "$(ENV)" ] && [ -n "$(REGION)" ] || (echo "Set ENV and REGION" && exit 1)
+	$(eval INSTANCE := $(shell aws cloudformation describe-stacks --stack-name tellcartman-$(ENV) --region $(REGION) --query "Stacks[0].Outputs[?OutputKey=='ServerInstanceId'].OutputValue" --output text))
+	aws ec2 stop-instances --instance-ids $(INSTANCE) --region $(REGION)
+	@echo "✓ Stopping $(INSTANCE). EC2 compute charges pause (EBS storage still ~\$$0.80/mo)."
+
+start-server:
+	@[ -n "$(ENV)" ] && [ -n "$(REGION)" ] || (echo "Set ENV and REGION" && exit 1)
+	$(eval INSTANCE := $(shell aws cloudformation describe-stacks --stack-name tellcartman-$(ENV) --region $(REGION) --query "Stacks[0].Outputs[?OutputKey=='ServerInstanceId'].OutputValue" --output text))
+	aws ec2 start-instances --instance-ids $(INSTANCE) --region $(REGION)
+	@echo "✓ Starting $(INSTANCE). Note: public IP may change after restart."

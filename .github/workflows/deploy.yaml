@@ -72,6 +72,12 @@ jobs:
             -o bin/tc-server \
             ./cmd/server
 
+      - name: Build coach binary
+        working-directory: server
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+          go build -trimpath -ldflags="-s -w" -o bin/tc-coach ./cmd/coach
+
       - name: Build Lambda zip
         working-directory: server
         run: |
@@ -80,6 +86,12 @@ jobs:
           cd bin && zip lambda-writer.zip bootstrap
 
       - uses: actions/upload-artifact@v4.6.2
+        with:
+          name: coach-binary
+          path: server/bin/tc-coach
+          retention-days: 1
+
+      - uses: actions/upload-artifact@v4
         with:
           name: server-binary
           path: server/bin/tc-server
@@ -294,6 +306,12 @@ jobs:
           name: server-binary
           path: ./artifacts
 
+      - name: Download coach binary artifact
+        uses: actions/download-artifact@v4.3.0
+        with:
+          name: coach-binary
+          path: ./artifacts
+
       # Resolve the data bucket (deterministic name) and instance ID directly
       # from CloudFormation outputs, rather than relying on cross-job outputs.
       - name: Resolve deploy targets
@@ -308,10 +326,12 @@ jobs:
           echo "instance=$INSTANCE" >> $GITHUB_OUTPUT
           echo "Bucket: $BUCKET  Instance: $INSTANCE"
 
-      - name: Upload server binary to S3
+      - name: Upload binaries to S3
         run: |
           aws s3 cp artifacts/tc-server \
             s3://${{ steps.resolve.outputs.bucket }}/binaries/server
+          aws s3 cp artifacts/tc-coach \
+            s3://${{ steps.resolve.outputs.bucket }}/binaries/coach
 
       - name: Deploy to EC2 via SSM RunCommand
         id: ssm
@@ -324,13 +344,18 @@ jobs:
               "echo Downloading new server binary...",
               "aws s3 cp s3://${{ steps.resolve.outputs.bucket }}/binaries/server /tmp/tc-server-new",
               "chmod +x /tmp/tc-server-new",
-              "echo Stopping service...",
               "systemctl stop tc-server || true",
               "mv /tmp/tc-server-new /usr/local/bin/tc-server",
-              "echo Starting service...",
               "systemctl start tc-server",
+              "echo Downloading new coach binary...",
+              "aws s3 cp s3://${{ steps.resolve.outputs.bucket }}/binaries/coach /tmp/tc-coach-new",
+              "chmod +x /tmp/tc-coach-new",
+              "systemctl stop tc-coach || true",
+              "mv /tmp/tc-coach-new /usr/local/bin/tc-coach",
+              "systemctl start tc-coach",
               "sleep 3",
-              "systemctl is-active tc-server && echo Service started successfully",
+              "systemctl is-active tc-server && echo server active",
+              "systemctl is-active tc-coach && echo coach active",
               "echo Deploy complete: ${{ github.sha }}"
             ]' \
             --query "Command.CommandId" \
