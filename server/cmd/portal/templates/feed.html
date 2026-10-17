@@ -1,0 +1,27 @@
+{{define "feed.html"}}
+{{if not .}}
+  <p style="color:var(--muted);font-size:13px">No events sent yet. Click an event to begin.</p>
+{{else}}
+  <ul style="list-style:none;margin:0;padding:0;font-size:13px">
+    {{range .}}
+    <li style="padding:8px 0;border-bottom:1px solid var(--border)">
+      <div style="display:flex;justify-content:space-between;gap:8px">
+        <strong>{{.PatientID}}</strong>
+        <span style="color:var(--muted)">{{fmtTime .When}}</span>
+      </div>
+      <div style="color:var(--muted)">
+        {{.Kind}}{{if .Feeling}} · feeling {{.Feeling}}/5{{end}}{{if .Event}} · {{.Event}}{{end}}
+      </div>
+      <div>
+        {{if .Accepted}}
+          <span style="color:#1a9850">✓ accepted</span>
+          <span style="color:var(--muted);font-family:ui-monospace,monospace;font-size:11px">{{.RecordID}}</span>
+        {{else}}
+          <span style="color:#d73027">✗ {{.Err}}</span>
+        {{end}}
+      </div>
+    </li>
+    {{end}}
+  </ul>
+{{end}}
+{{end}}
