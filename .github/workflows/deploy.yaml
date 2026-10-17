@@ -144,6 +144,39 @@ jobs:
           echo "subnet_id=$SUBNET_ID" >> $GITHUB_OUTPUT
           echo "Using VPC $VPC_ID, subnet $SUBNET_ID"
 
+      - name: Download lambda artifact
+        uses: actions/download-artifact@v4.3.0
+        with:
+          name: lambda-zip
+          path: ./artifacts
+
+      # The Lambda in the stack needs its deployment zip in S3 at CREATE time.
+      # We use a dedicated artifacts bucket (separate from the CF-managed data
+      # bucket) that this job creates and populates first. This cleanly breaks
+      # the chicken-and-egg: data bucket is owned by CloudFormation; the Lambda
+      # code bucket is owned by the pipeline.
+      - name: Bootstrap artifacts bucket + Lambda zip
+        id: artifacts
+        run: |
+          ART_BUCKET=tc-artifacts-${{ env.ENV }}-${{ secrets.AWS_ACCOUNT_ID }}
+          REGION=${{ secrets.AWS_REGION }}
+
+          if ! aws s3api head-bucket --bucket "$ART_BUCKET" 2>/dev/null; then
+            echo "Creating artifacts bucket $ART_BUCKET..."
+            aws s3api create-bucket \
+              --bucket "$ART_BUCKET" \
+              --region "$REGION" \
+              --create-bucket-configuration LocationConstraint="$REGION"
+            aws s3api put-public-access-block \
+              --bucket "$ART_BUCKET" \
+              --public-access-block-configuration \
+                BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+          fi
+
+          aws s3 cp artifacts/lambda-writer.zip "s3://$ART_BUCKET/binaries/lambda-writer.zip"
+          echo "art_bucket=$ART_BUCKET" >> $GITHUB_OUTPUT
+          echo "Artifacts ready in $ART_BUCKET"
+
       - name: Deploy CloudFormation stack
         run: |
           aws cloudformation deploy \
@@ -153,12 +186,12 @@ jobs:
               Env=${{ env.ENV }} \
               VpcId=${{ steps.network.outputs.vpc_id }} \
               SubnetId=${{ steps.network.outputs.subnet_id }} \
-              LambdaS3BucketParam=tellcartman-raw-${{ env.ENV }}-${{ secrets.AWS_ACCOUNT_ID }} \
+              LambdaS3BucketParam=${{ steps.artifacts.outputs.art_bucket }} \
               LambdaS3KeyParam=binaries/lambda-writer.zip \
             --capabilities CAPABILITY_NAMED_IAM \
             --no-fail-on-empty-changeset
+          echo "CloudFormation deploy complete"
 
-      # Read CloudFormation outputs for use in downstream jobs
       - name: Get stack outputs
         id: outputs
         run: |
@@ -208,21 +241,23 @@ jobs:
           name: lambda-zip
           path: ./artifacts
 
-      # Upload zip to S3 first (CF references it for future stack updates)
-      - name: Upload Lambda zip to S3
+      # The Lambda was already created by the stack from the artifacts bucket.
+      # This step pushes the latest zip + updates the function code so that
+      # subsequent deploys (code-only changes) take effect without a stack update.
+      - name: Upload Lambda zip to artifacts bucket
         run: |
+          ART_BUCKET=tc-artifacts-${{ env.ENV }}-${{ secrets.AWS_ACCOUNT_ID }}
           aws s3 cp artifacts/lambda-writer.zip \
-            s3://${{ needs.deploy-infra.outputs.bucket_name }}/binaries/lambda-writer.zip
+            s3://$ART_BUCKET/binaries/lambda-writer.zip
 
-      # Update the function code directly — faster than a CF stack update
       - name: Update Lambda function code
         run: |
+          ART_BUCKET=tc-artifacts-${{ env.ENV }}-${{ secrets.AWS_ACCOUNT_ID }}
           aws lambda update-function-code \
             --function-name ${{ needs.deploy-infra.outputs.lambda_function }} \
-            --s3-bucket ${{ needs.deploy-infra.outputs.bucket_name }} \
+            --s3-bucket $ART_BUCKET \
             --s3-key binaries/lambda-writer.zip
 
-      # Wait for the update to finish before declaring success
       - name: Wait for Lambda update
         run: |
           aws lambda wait function-updated \

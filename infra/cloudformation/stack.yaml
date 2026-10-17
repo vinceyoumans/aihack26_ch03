@@ -375,9 +375,13 @@ Resources:
           # ── Install CloudWatch agent for logs ───────────────────────────────
           yum install -y amazon-cloudwatch-agent
 
-          # ── Download server binary from S3 ──────────────────────────────────
-          aws s3 cp s3://${TellCartmanBucket}/binaries/server /usr/local/bin/tc-server
-          chmod +x /usr/local/bin/tc-server
+          # ── Download server binary from S3 (if present) ─────────────────────
+          # On first boot the binary may not exist yet — the deploy-server job
+          # uploads it and restarts the service via SSM after the stack is up.
+          # So we don't fail the boot if the binary is missing.
+          aws s3 cp s3://${TellCartmanBucket}/binaries/server /usr/local/bin/tc-server || \
+            echo "server binary not yet uploaded; deploy-server will install it"
+          [ -f /usr/local/bin/tc-server ] && chmod +x /usr/local/bin/tc-server || true
 
           # ── Write environment config ─────────────────────────────────────────
           cat > /etc/tc-server.env <<EOF
@@ -410,7 +414,9 @@ Resources:
 
           systemctl daemon-reload
           systemctl enable tc-server
-          systemctl start tc-server
+          # Only start if the binary exists; otherwise deploy-server starts it later
+          [ -f /usr/local/bin/tc-server ] && systemctl start tc-server || \
+            echo "deferring service start until binary is deployed"
 
   # ── CloudFront: Distribution ───────────────────────────────────────────────
   # Serves photos/* from S3 over HTTPS via OAC (Origin Access Control).
