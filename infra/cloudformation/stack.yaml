@@ -1,0 +1,527 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  TellCartman Stage 2 — Full stack: EC2 gRPC server, SQS, Lambda S3 writer,
+  S3 raw bucket, SNS event stub, CloudFront distribution, IAM roles.
+
+# ════════════════════════════════════════════════════════════════════════════
+# PARAMETERS
+# ════════════════════════════════════════════════════════════════════════════
+Parameters:
+  Env:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment. Controls resource naming and settings.
+
+  AllowedGrpcCidr:
+    Type: String
+    Default: "0.0.0.0/0"
+    Description: >
+      CIDR range allowed to reach gRPC port 50051.
+      Restrict to your client IP range before staging/prod.
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: >
+      Latest Amazon Linux 2023 AMI, resolved automatically from SSM.
+      You never need to hardcode an AMI ID.
+
+  LambdaS3BucketParam:
+    Type: String
+    Description: >
+      S3 bucket where lambda-writer.zip was uploaded by CI before deploying.
+      The deploy workflow uploads the zip here, then CF references it.
+
+  LambdaS3KeyParam:
+    Type: String
+    Default: "binaries/lambda-writer.zip"
+    Description: S3 key for the Lambda deployment zip.
+
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: >
+      Email address for DLQ alarm notifications. Leave empty to skip.
+
+# ════════════════════════════════════════════════════════════════════════════
+# CONDITIONS
+# ════════════════════════════════════════════════════════════════════════════
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+  IsProd: !Equals [!Ref Env, "prod"]
+
+# ════════════════════════════════════════════════════════════════════════════
+# RESOURCES
+# ════════════════════════════════════════════════════════════════════════════
+Resources:
+
+  # ── S3: Raw Ingestion Bucket ───────────────────────────────────────────────
+  # Stores telemetry JSONL files, patient photos, and audio clips.
+  # CloudFront serves the photos/* prefix publicly (read-only).
+  TellCartmanBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "tellcartman-raw-${Env}-${AWS::AccountId}"
+      # Versioning allows recovery if a bad write corrupts a key
+      VersioningConfiguration:
+        Status: Enabled
+      # SSE-S3 encrypts all objects at rest at no extra cost
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      # Block all public access — CloudFront uses OAC, not public bucket
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # Lifecycle: move raw JSONL to IA after 30 days, expire after 365
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveRaw
+            Status: Enabled
+            Prefix: raw/
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+            ExpirationInDays: 365
+      # S3 event fires when Lambda writes a new JSONL file
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: raw/
+            Topic: !Ref RawEventsTopic
+    DependsOn: RawEventsTopicPolicy
+
+  # Allow S3 to publish to the SNS topic
+  RawEventsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref RawEventsTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowS3Publish
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref RawEventsTopic
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:s3:::tellcartman-raw-${Env}-${AWS::AccountId}"
+
+  # Bucket policy: allow CloudFront OAC to read photos/* only
+  TellCartmanBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TellCartmanBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${TellCartmanBucket.Arn}/photos/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+
+  # ── SQS: Records Queue + DLQ ──────────────────────────────────────────────
+  # The gRPC server publishes one message per PatientRecord.
+  # Lambda polls this queue and batches records into S3 JSONL files.
+  RecordsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "tc-records-dlq-${Env}"
+      # Messages that fail 3 times land here for manual inspection
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  RecordsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "tc-records-${Env}"
+      MessageRetentionPeriod: 345600   # 4 days
+      VisibilityTimeout: 120           # must be >= Lambda timeout (60s) * 2
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt RecordsDLQ.Arn
+        maxReceiveCount: 3             # retry 3x before DLQ
+
+  # Allow EC2 instance role to send messages to the queue
+  RecordsQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref RecordsQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowServerSend
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt ServerInstanceRole.Arn
+            Action: sqs:SendMessage
+            Resource: !GetAtt RecordsQueue.Arn
+
+  # ── SNS: Raw Events Topic (Stage 3 consumer stub) ─────────────────────────
+  # S3 publishes here when a new JSONL file lands in raw/.
+  # Stage 3 (AI analysis) will subscribe a Lambda to this topic.
+  RawEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "tc-raw-events-${Env}"
+      DisplayName: TellCartman Raw S3 Events
+
+  # ── IAM: EC2 Server Instance Role ─────────────────────────────────────────
+  # Least privilege: SQS publish + S3 presign/audio write only.
+  # No SSH access; SSM Session Manager is used instead.
+  ServerInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "tc-server-role-${Env}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # SSM Session Manager access — replaces SSH
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: TellCartmanServerPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Publish patient records to SQS
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt RecordsQueue.Arn
+              # Write audio clips and generate presigned URLs for photos
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource:
+                  - !Sub "${TellCartmanBucket.Arn}/audio/*"
+                  - !Sub "${TellCartmanBucket.Arn}/photos/*"
+              # Read the server binary during startup
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${TellCartmanBucket.Arn}/binaries/*"
+
+  ServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "tc-server-profile-${Env}"
+      Roles:
+        - !Ref ServerInstanceRole
+
+  # ── IAM: Lambda Writer Role ────────────────────────────────────────────────
+  # Least privilege: SQS consume + S3 write to raw/ only.
+  WriterLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "tc-lambda-writer-role-${Env}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: TellCartmanLambdaWriterPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Consume messages from SQS
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt RecordsQueue.Arn
+              # Write JSONL files to raw/ prefix only
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${TellCartmanBucket.Arn}/raw/*"
+              # CloudWatch Logs
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/tc-writer-${Env}:*"
+
+  # ── Lambda: S3 Writer ──────────────────────────────────────────────────────
+  # Polls SQS, batches records over 60 seconds, writes JSONL to S3.
+  # Written in Go, compiled to provided.al2023 runtime (binary: bootstrap).
+  WriterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "tc-writer-${Env}"
+      Runtime: provided.al2023
+      Handler: bootstrap          # Go binary must be named bootstrap
+      Role: !GetAtt WriterLambdaRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaS3BucketParam
+        S3Key: !Ref LambdaS3KeyParam
+      Timeout: 60                 # 1-minute max; batch window is also 60s
+      MemorySize: 128
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref TellCartmanBucket
+          QUEUE_URL: !Ref RecordsQueue
+          ENV: !Ref Env
+      Architectures:
+        - x86_64
+
+  WriterFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/tc-writer-${Env}"
+      RetentionInDays: 30
+
+  # SQS event source mapping: Lambda polls queue, batches up to 60 seconds
+  WriterEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt RecordsQueue.Arn
+      FunctionName: !GetAtt WriterFunction.Arn
+      BatchSize: 100
+      # 60-second tumbling window: Lambda waits up to 60s to fill a batch
+      # This is how we achieve "one S3 file per minute"
+      MaximumBatchingWindowInSeconds: 60
+      FunctionResponseTypes:
+        - ReportBatchItemFailures  # lets Lambda report partial batch failures
+
+  # ── EC2: gRPC Server Security Group ───────────────────────────────────────
+  ServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "tc-server-sg-${Env}"
+      GroupDescription: TellCartman gRPC server security group
+      SecurityGroupIngress:
+        # gRPC port: restricted to configured CIDR
+        - IpProtocol: tcp
+          FromPort: 50051
+          ToPort: 50051
+          CidrIp: !Ref AllowedGrpcCidr
+        # HTTP port for CloudFront health check (restricted to CF prefix list)
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: "0.0.0.0/0"
+        # NOTE: Port 22 (SSH) is intentionally omitted.
+        # Use SSM Session Manager: aws ssm start-session --target <instance-id>
+      SecurityGroupEgress:
+        # Allow all outbound (needed for SQS, S3, SSM API calls)
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+
+  # ── EC2: gRPC Server Instance ──────────────────────────────────────────────
+  # t3.micro running the Go gRPC server as a systemd service.
+  # UserData installs Go, downloads the server binary from S3, and starts it.
+  ServerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: !Ref LatestAmiId
+      IamInstanceProfile: !Ref ServerInstanceProfile
+      SecurityGroupIds:
+        - !Ref ServerSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "tc-grpc-server-${Env}"
+        - Key: Env
+          Value: !Ref Env
+      UserData:
+        # UserData runs once on first boot.
+        # It installs Go, downloads the server binary, and starts a systemd service.
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+
+          # ── Install Go ──────────────────────────────────────────────────────
+          yum install -y golang
+          export GOPATH=/usr/local/go
+          export PATH=$PATH:/usr/local/go/bin
+
+          # ── Install CloudWatch agent for logs ───────────────────────────────
+          yum install -y amazon-cloudwatch-agent
+
+          # ── Download server binary from S3 ──────────────────────────────────
+          aws s3 cp s3://${TellCartmanBucket}/binaries/server /usr/local/bin/tc-server
+          chmod +x /usr/local/bin/tc-server
+
+          # ── Write environment config ─────────────────────────────────────────
+          cat > /etc/tc-server.env <<EOF
+          QUEUE_URL=${RecordsQueue}
+          BUCKET_NAME=${TellCartmanBucket}
+          GRPC_PORT=50051
+          HEALTH_PORT=8080
+          ENV=${Env}
+          AWS_REGION=${AWS::Region}
+          EOF
+
+          # ── Create systemd service ───────────────────────────────────────────
+          cat > /etc/systemd/system/tc-server.service <<EOF
+          [Unit]
+          Description=TellCartman gRPC Server
+          After=network.target
+
+          [Service]
+          Type=simple
+          EnvironmentFile=/etc/tc-server.env
+          ExecStart=/usr/local/bin/tc-server
+          Restart=on-failure
+          RestartSec=5
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          systemctl daemon-reload
+          systemctl enable tc-server
+          systemctl start tc-server
+
+  # ── CloudFront: Distribution ───────────────────────────────────────────────
+  # Serves photos/* from S3 over HTTPS via OAC (Origin Access Control).
+  # OAC is the modern replacement for OAI — it signs requests with SigV4.
+  #
+  # Why CloudFront for photos?
+  # - Patients and coaches access photos from a CDN edge, not S3 directly
+  # - S3 bucket stays private; OAC grants CloudFront read-only access
+  # - HTTPS is enforced; no cleartext health data over HTTP
+
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "tc-oac-${Env}"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "TellCartman patient photos CDN (${Env})"
+        HttpVersion: http2
+        PriceClass: PriceClass_100  # North America + Europe edge nodes only
+        DefaultRootObject: ""
+
+        Origins:
+          - Id: S3PhotosOrigin
+            DomainName: !GetAtt TellCartmanBucket.RegionalDomainName
+            OriginPath: /photos          # serve only the photos/ prefix
+            S3OriginConfig:
+              OriginAccessIdentity: ""   # empty when using OAC
+            OriginAccessControlId: !GetAtt CloudFrontOAC.Id
+
+        DefaultCacheBehavior:
+          TargetOriginId: S3PhotosOrigin
+          ViewerProtocolPolicy: redirect-to-https  # enforce HTTPS
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized (AWS managed)
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+
+        # Custom error: return 403 as 404 to avoid leaking path info
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 404
+            ResponsePagePath: /not-found
+            ErrorCachingMinTTL: 10
+
+  # ── CloudWatch: DLQ Alarm ─────────────────────────────────────────────────
+  # Fires when messages accumulate in the DLQ — indicates Lambda failures.
+  DLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasAlertEmail
+    Properties:
+      AlarmName: !Sub "tc-dlq-nonempty-${Env}"
+      AlarmDescription: Messages in DLQ — Lambda writer may be failing
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt RecordsDLQ.QueueName
+      Statistic: Sum
+      Period: 300           # check every 5 minutes
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlertEmail
+    Properties:
+      TopicName: !Sub "tc-alerts-${Env}"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+# ════════════════════════════════════════════════════════════════════════════
+# OUTPUTS
+# ════════════════════════════════════════════════════════════════════════════
+Outputs:
+  BucketName:
+    Description: S3 raw ingestion bucket name
+    Value: !Ref TellCartmanBucket
+    Export:
+      Name: !Sub "tc-bucket-${Env}"
+
+  QueueUrl:
+    Description: SQS records queue URL
+    Value: !Ref RecordsQueue
+    Export:
+      Name: !Sub "tc-queue-url-${Env}"
+
+  QueueArn:
+    Description: SQS records queue ARN
+    Value: !GetAtt RecordsQueue.Arn
+    Export:
+      Name: !Sub "tc-queue-arn-${Env}"
+
+  RawEventsTopicArn:
+    Description: SNS topic ARN for S3 raw events (Stage 3 attaches consumer here)
+    Value: !Ref RawEventsTopic
+    Export:
+      Name: !Sub "tc-raw-events-topic-${Env}"
+
+  ServerInstanceId:
+    Description: EC2 instance ID of the gRPC server
+    Value: !Ref ServerInstance
+    Export:
+      Name: !Sub "tc-server-instance-id-${Env}"
+
+  CloudFrontDomain:
+    Description: CloudFront domain for patient photos (HTTPS)
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub "tc-cf-domain-${Env}"
+
+  LambdaFunctionName:
+    Description: Lambda S3 writer function name
+    Value: !Ref WriterFunction
+    Export:
+      Name: !Sub "tc-lambda-writer-${Env}"

@@ -1,0 +1,327 @@
+# .github/workflows/deploy.yaml
+# TellCartman Deploy Pipeline — infra + app to AWS
+#
+# TRIGGER: Push to the `deploydev` branch only.
+# Every push to deploydev runs CI first, then deploys to the dev environment.
+#
+# Deploy sequence:
+#   1. build          — compile server + lambda (same as ci.yaml)
+#   2. deploy-infra   — aws cloudformation deploy (idempotent)
+#   3. deploy-lambda  — upload zip to S3, update Lambda function code
+#   4. deploy-server  — upload binary to S3, restart EC2 via SSM RunCommand
+#
+# Required GitHub Secrets (Settings → Secrets and variables → Actions):
+#   AWS_ACCESS_KEY_ID      — IAM user with CF deploy + S3 + Lambda + SSM permissions
+#   AWS_SECRET_ACCESS_KEY  — corresponding secret key
+#   AWS_REGION             — your AWS region (e.g. us-east-1)
+#   AWS_ACCOUNT_ID         — your 12-digit AWS account ID
+#
+# These are set per-environment using GitHub Environments (Settings → Environments).
+# Create a "dev" environment and scope the secrets there.
+
+name: Deploy
+
+on:
+  push:
+    branches: [deploydev]
+
+# Only one deploy at a time — prevent race conditions on the same environment
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: false   # don't cancel — let the current deploy finish
+
+env:
+  GO_VERSION:   "1.22"
+  ENV:          "dev"
+  STACK_NAME:   "tellcartman-dev"
+  CF_TEMPLATE:  "infra/cloudformation/stack.yaml"
+  CF_PARAMS:    "infra/cloudformation/parameters/dev.json"
+
+jobs:
+
+  # ── Build ────────────────────────────────────────────────────────────────────
+  # Identical to ci.yaml build job — produces artifacts for deploy jobs.
+  # We re-build here (not download from CI) to guarantee the deployed binary
+  # matches the exact commit being deployed.
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: server/go.sum
+
+      - name: Download dependencies
+        working-directory: server
+        run: go mod download
+
+      - name: Run tests (gate — don't deploy if tests fail)
+        working-directory: server
+        run: go test -race -count=1 -timeout=120s ./...
+
+      - name: Build server binary
+        working-directory: server
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+          go build \
+            -trimpath \
+            -ldflags="-s -w -X main.version=${{ github.sha }}" \
+            -o bin/tc-server \
+            ./cmd/server
+
+      - name: Build Lambda zip
+        working-directory: server
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+          go build -trimpath -ldflags="-s -w" -o bin/bootstrap ./cmd/lambda-writer
+          cd bin && zip lambda-writer.zip bootstrap
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-binary
+          path: server/bin/tc-server
+          retention-days: 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lambda-zip
+          path: server/bin/lambda-writer.zip
+          retention-days: 1
+
+  # ── Deploy Infrastructure (CloudFormation) ───────────────────────────────────
+  # CloudFormation deploy is idempotent — running it on an already-deployed stack
+  # only applies changes. If nothing changed, it completes in seconds.
+  deploy-infra:
+    name: Deploy Infrastructure
+    runs-on: ubuntu-latest
+    needs: [build]
+    environment: dev    # uses GitHub Environment secrets
+    outputs:
+      bucket_name:      ${{ steps.outputs.outputs.bucket_name }}
+      lambda_function:  ${{ steps.outputs.outputs.lambda_function }}
+      instance_id:      ${{ steps.outputs.outputs.instance_id }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      # Before deploying CF, we need a bucket to upload the Lambda zip to.
+      # We use a separate "bootstrap" bucket or the existing one if it exists.
+      # For the first deploy, create the bucket manually or via a separate step.
+      - name: Deploy CloudFormation stack
+        run: |
+          aws cloudformation deploy \
+            --stack-name ${{ env.STACK_NAME }} \
+            --template-file ${{ env.CF_TEMPLATE }} \
+            --parameter-overrides \
+              Env=${{ env.ENV }} \
+              LambdaS3BucketParam=tellcartman-raw-${{ env.ENV }}-${{ secrets.AWS_ACCOUNT_ID }} \
+              LambdaS3KeyParam=binaries/lambda-writer.zip \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset
+
+      # Read CloudFormation outputs for use in downstream jobs
+      - name: Get stack outputs
+        id: outputs
+        run: |
+          BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --query "Stacks[0].Outputs[?OutputKey=='BucketName'].OutputValue" \
+            --output text)
+
+          LAMBDA=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --query "Stacks[0].Outputs[?OutputKey=='LambdaFunctionName'].OutputValue" \
+            --output text)
+
+          INSTANCE=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --query "Stacks[0].Outputs[?OutputKey=='ServerInstanceId'].OutputValue" \
+            --output text)
+
+          echo "bucket_name=$BUCKET"   >> $GITHUB_OUTPUT
+          echo "lambda_function=$LAMBDA" >> $GITHUB_OUTPUT
+          echo "instance_id=$INSTANCE" >> $GITHUB_OUTPUT
+
+          echo "S3 Bucket:   $BUCKET"
+          echo "Lambda:      $LAMBDA"
+          echo "EC2 Instance: $INSTANCE"
+
+  # ── Deploy Lambda ────────────────────────────────────────────────────────────
+  # Upload the Lambda zip to S3, then update the function code.
+  # Lambda update is near-instant — new code is live within seconds.
+  deploy-lambda:
+    name: Deploy Lambda
+    runs-on: ubuntu-latest
+    needs: [deploy-infra]
+    environment: dev
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Download lambda artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: lambda-zip
+          path: ./artifacts
+
+      # Upload zip to S3 first (CF references it for future stack updates)
+      - name: Upload Lambda zip to S3
+        run: |
+          aws s3 cp artifacts/lambda-writer.zip \
+            s3://${{ needs.deploy-infra.outputs.bucket_name }}/binaries/lambda-writer.zip
+
+      # Update the function code directly — faster than a CF stack update
+      - name: Update Lambda function code
+        run: |
+          aws lambda update-function-code \
+            --function-name ${{ needs.deploy-infra.outputs.lambda_function }} \
+            --s3-bucket ${{ needs.deploy-infra.outputs.bucket_name }} \
+            --s3-key binaries/lambda-writer.zip
+
+      # Wait for the update to finish before declaring success
+      - name: Wait for Lambda update
+        run: |
+          aws lambda wait function-updated \
+            --function-name ${{ needs.deploy-infra.outputs.lambda_function }}
+          echo "✓ Lambda updated successfully"
+
+  # ── Deploy Server (EC2) ──────────────────────────────────────────────────────
+  # Upload the server binary to S3, then use SSM RunCommand to:
+  #   1. Pull the new binary from S3
+  #   2. Stop the systemd service
+  #   3. Replace the binary
+  #   4. Start the service
+  #
+  # Why SSM instead of CodeDeploy?
+  #   SSM RunCommand is simpler for a single instance POC. CodeDeploy adds
+  #   rolling deploys and rollback — worth adding when you have multiple instances.
+  deploy-server:
+    name: Deploy Server
+    runs-on: ubuntu-latest
+    needs: [deploy-infra]
+    environment: dev
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Download server binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: server-binary
+          path: ./artifacts
+
+      # Upload binary to S3 — EC2 instance pulls from here
+      - name: Upload server binary to S3
+        run: |
+          aws s3 cp artifacts/tc-server \
+            s3://${{ needs.deploy-infra.outputs.bucket_name }}/binaries/server
+
+      # SSM RunCommand executes a shell script on the EC2 instance.
+      # The instance role has s3:GetObject on binaries/* so it can pull the binary.
+      - name: Deploy to EC2 via SSM RunCommand
+        id: ssm
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids ${{ needs.deploy-infra.outputs.instance_id }} \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=[
+              "set -euo pipefail",
+              "echo Downloading new server binary...",
+              "aws s3 cp s3://${{ needs.deploy-infra.outputs.bucket_name }}/binaries/server /tmp/tc-server-new",
+              "chmod +x /tmp/tc-server-new",
+              "echo Stopping service...",
+              "systemctl stop tc-server || true",
+              "mv /tmp/tc-server-new /usr/local/bin/tc-server",
+              "echo Starting service...",
+              "systemctl start tc-server",
+              "sleep 3",
+              "systemctl is-active tc-server && echo Service started successfully",
+              "echo Deploy complete: ${{ github.sha }}"
+            ]' \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "command_id=$COMMAND_ID" >> $GITHUB_OUTPUT
+          echo "SSM Command ID: $COMMAND_ID"
+
+      # Poll until the SSM command completes (success or failure)
+      - name: Wait for SSM command
+        run: |
+          INSTANCE_ID=${{ needs.deploy-infra.outputs.instance_id }}
+          COMMAND_ID=${{ steps.ssm.outputs.command_id }}
+
+          for i in $(seq 1 30); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id $COMMAND_ID \
+              --instance-id $INSTANCE_ID \
+              --query "Status" --output text 2>/dev/null || echo "Pending")
+
+            echo "Attempt $i: SSM command status = $STATUS"
+
+            if [ "$STATUS" = "Success" ]; then
+              echo "✓ Server deployed successfully"
+              exit 0
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ]; then
+              echo "✗ SSM command failed with status: $STATUS"
+              # Print the error output
+              aws ssm get-command-invocation \
+                --command-id $COMMAND_ID \
+                --instance-id $INSTANCE_ID \
+                --query "StandardErrorContent" --output text
+              exit 1
+            fi
+
+            sleep 10
+          done
+
+          echo "✗ Timed out waiting for SSM command"
+          exit 1
+
+      # Run integration tests against the newly deployed server
+      - name: Smoke test deployed server
+        run: |
+          INSTANCE_IP=$(aws ec2 describe-instances \
+            --instance-ids ${{ needs.deploy-infra.outputs.instance_id }} \
+            --query "Reservations[0].Instances[0].PublicIpAddress" \
+            --output text)
+
+          echo "Testing server at $INSTANCE_IP:50051"
+
+          # grpcurl checks the health of the gRPC server
+          # Install grpcurl if not present
+          which grpcurl || \
+            (curl -sSL https://github.com/fullstorydev/grpcurl/releases/download/v1.9.1/grpcurl_1.9.1_linux_x86_64.tar.gz | \
+             tar -xz -C /usr/local/bin grpcurl)
+
+          # List services — only works if reflection is enabled (dev only)
+          grpcurl -plaintext $INSTANCE_IP:50051 list || \
+            echo "gRPC reflection not enabled (expected in staging/prod)"
+
+          # HTTP health check
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://$INSTANCE_IP:8080/health)
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "✓ Health check passed"
+          else
+            echo "✗ Health check returned HTTP $HTTP_STATUS"
+            exit 1
+          fi
