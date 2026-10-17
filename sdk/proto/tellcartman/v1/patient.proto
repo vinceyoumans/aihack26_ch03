@@ -15,7 +15,7 @@ syntax = "proto3";
 package tellcartman.v1;
 
 // Language-specific generated package/module names:
-option go_package     = "github.com/vinceyoumans/aihack26_ch03/gen/go/tellcartman/v1;tellcartmanv1";
+option go_package     = "github.com/vinceyoumans/aihack26_ch03/server/proto/gen;gen";
 option java_package   = "com.tellcartman.grpc.generated";
 option java_outer_classname = "PatientProto";
 option java_multiple_files = true;

@@ -198,28 +198,21 @@ This section captures the Stage 2 work actually built on 2026-10-17.
 - 4 secrets identified for GitHub dev environment (ACCESS_KEY_ID, SECRET, REGION=us-east-2, ACCOUNT_ID=483199420446)
 - **Refs:** NFR-03, FR-09
 
-### 🔶 Task S2.8 — Proto Generated Code
-- Hand-written stub at `server/proto/gen/patient.go` provides all types + gRPC service
-- **TODO:** Run `buf generate` to produce real protobuf code, replace stub, switch
-  SQS publisher + Lambda back to `protojson` for canonical JSON field names
+### ✅ Task S2.8 — Proto Generated Code
+- Real protobuf Go code generated with `protoc` + `protoc-gen-go` + `protoc-gen-go-grpc`
+- Output at `server/proto/gen/patient.pb.go` + `patient_grpc.pb.go` (package `gen`)
+- Hand-written stub removed; gRPC wire serialization now works correctly
+- proto `go_package` updated to `.../server/proto/gen;gen`
 - **Refs:** FR-01
 
-### 🧱 Task S2.9 — Fix Go Build + Tests (CURRENT BLOCKER)
-Status as of last session:
-- ✅ go.mod fixed (removed invalid s3manager dep, bumped aws-lambda-go to v1.55.1, added google/uuid)
-- ✅ `go build ./...` passes for non-test packages
-- ✅ Extracted `MessagePublisher` + `ObjectStore` interfaces in `internal/server/interfaces.go`
-  so tests can inject mocks
-- ✅ handler.go updated to depend on interfaces
-- ✅ Lambda handler being updated to use an `s3Putter` interface (was mid-edit when interrupted)
-- ⬜ REMAINING:
-  1. Finish lambda handler `s3Putter` interface change
-  2. Fix `handler_test.go` — mocks now satisfy interfaces (should pass once interfaces land)
-  3. Fix `lambda/writer/handler_test.go` — remove `protojson.Marshal`, use `json.Marshal`;
-     mock already matches `s3Putter`
-  4. Fix `e2e_test.go` if needed
-  5. Run `go test -race ./...` until green
-  6. Commit + push to `deploydev` to re-trigger deploy
+### ✅ Task S2.9 — Fix Go Build + Tests (RESOLVED)
+- ✅ go.mod fixed (removed invalid s3manager dep, aws-lambda-go v1.55.1, google/uuid, grpc v1.67.1)
+- ✅ `MessagePublisher` + `ObjectStore` interfaces in `internal/server/interfaces.go`
+- ✅ Lambda uses `s3Putter` interface for test mocking
+- ✅ SQS publisher + Lambda use `encoding/json` (works with generated types)
+- ✅ Thread-safe mock publisher (mutex) — fixes data race in concurrent e2e test
+- ✅ `go build ./...` clean, `go vet ./...` clean, `gofmt` clean
+- ✅ `go test -race -count=1 ./...` — ALL PASS (server + lambda packages)
 - **Refs:** FR-09, NFR-02
 
 ### ⬜ Task S2.10 — First Successful AWS Deploy

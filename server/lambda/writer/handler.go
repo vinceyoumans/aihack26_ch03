@@ -22,29 +22,28 @@ import (
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/google/uuid"
-	"google.golang.org/protobuf/encoding/protojson"
 
 	tcv1 "github.com/vinceyoumans/aihack26_ch03/server/proto/gen"
 )
 
+// s3Putter is the interface for S3 PutObject — allows test mocking.
+type s3Putter interface {
+	PutObject(ctx context.Context, in *awss3.PutObjectInput, opts ...func(*awss3.Options)) (*awss3.PutObjectOutput, error)
+}
+
 // Handler processes SQS batches and writes JSONL files to S3.
 type Handler struct {
-	s3Client   *awss3.Client
+	s3Client   s3Putter
 	bucketName string
 	logger     *slog.Logger
-	// unmarshaler configured once — reused across invocations
-	unmarshaler protojson.UnmarshalOptions
 }
 
 // NewHandler creates a new Lambda Handler.
-func NewHandler(s3Client *awss3.Client, bucketName string, logger *slog.Logger) *Handler {
+func NewHandler(s3Client s3Putter, bucketName string, logger *slog.Logger) *Handler {
 	return &Handler{
 		s3Client:   s3Client,
 		bucketName: bucketName,
 		logger:     logger,
-		unmarshaler: protojson.UnmarshalOptions{
-			DiscardUnknown: true, // tolerate records from older schema versions
-		},
 	}
 }
 
@@ -54,12 +53,12 @@ func NewHandler(s3Client *awss3.Client, bucketName string, logger *slog.Logger) 
 func (h *Handler) HandleRequest(
 	ctx context.Context,
 	event events.SQSEvent,
-) (events.SQSBatchResponse, error) {
+) (events.SQSEventResponse, error) {
 
 	var (
-		buf          bytes.Buffer
-		failedItems  []events.SQSBatchItemFailure
-		recordCount  int
+		buf         bytes.Buffer
+		failedItems []events.SQSBatchItemFailure
+		recordCount int
 	)
 
 	h.logger.InfoContext(ctx, "batch received", "count", len(event.Records))
@@ -70,7 +69,7 @@ func (h *Handler) HandleRequest(
 			// Malformed message — report as failure so SQS can route to DLQ
 			h.logger.WarnContext(ctx, "skipping malformed message",
 				"message_id", msg.MessageId,
-				"error",      err,
+				"error", err,
 			)
 			failedItems = append(failedItems, events.SQSBatchItemFailure{
 				ItemIdentifier: msg.MessageId,
@@ -84,7 +83,7 @@ func (h *Handler) HandleRequest(
 		if err != nil {
 			h.logger.WarnContext(ctx, "failed to re-encode record",
 				"record_id", record.GetRecordId(),
-				"error",     err,
+				"error", err,
 			)
 			failedItems = append(failedItems, events.SQSBatchItemFailure{
 				ItemIdentifier: msg.MessageId,
@@ -102,22 +101,22 @@ func (h *Handler) HandleRequest(
 		s3Key := buildS3Key(time.Now().UTC())
 		if err := h.writeToS3(ctx, s3Key, buf.Bytes()); err != nil {
 			h.logger.ErrorContext(ctx, "failed to write batch to S3",
-				"s3_key",       s3Key,
+				"s3_key", s3Key,
 				"record_count", recordCount,
-				"error",        err,
+				"error", err,
 			)
 			// Return error to trigger full batch retry
 			// (all message IDs will be retried by SQS)
-			return events.SQSBatchResponse{}, fmt.Errorf("s3 write failed: %w", err)
+			return events.SQSEventResponse{}, fmt.Errorf("s3 write failed: %w", err)
 		}
 
 		h.logger.InfoContext(ctx, "batch written to S3",
-			"s3_key",       s3Key,
+			"s3_key", s3Key,
 			"record_count", recordCount,
 		)
 	}
 
-	return events.SQSBatchResponse{BatchItemFailures: failedItems}, nil
+	return events.SQSEventResponse{BatchItemFailures: failedItems}, nil
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -125,8 +124,8 @@ func (h *Handler) HandleRequest(
 // unmarshalRecord deserializes a SQS message body into a PatientRecord.
 func (h *Handler) unmarshalRecord(body string) (*tcv1.PatientRecord, error) {
 	var record tcv1.PatientRecord
-	if err := h.unmarshaler.Unmarshal([]byte(body), &record); err != nil {
-		return nil, fmt.Errorf("protojson unmarshal: %w", err)
+	if err := json.Unmarshal([]byte(body), &record); err != nil {
+		return nil, fmt.Errorf("json unmarshal: %w", err)
 	}
 	return &record, nil
 }
@@ -148,7 +147,8 @@ func (h *Handler) writeToS3(ctx context.Context, key string, data []byte) error 
 // Pattern: raw/2026/01/15/08/05/550e8400-uuid.jsonl
 //
 // Partitioning by time makes it easy to query with Athena:
-//   SELECT * FROM records WHERE year='2026' AND month='01' AND day='15'
+//
+//	SELECT * FROM records WHERE year='2026' AND month='01' AND day='15'
 func buildS3Key(t time.Time) string {
 	return fmt.Sprintf("raw/%s/%s.jsonl",
 		t.Format("2006/01/02/15/04"),
@@ -157,21 +157,15 @@ func buildS3Key(t time.Time) string {
 }
 
 // protoToMap converts a PatientRecord to a map[string]interface{} for JSON encoding.
-// We use protojson to serialize to JSON string first, then unmarshal to a map.
-// This preserves protojson's field naming conventions (snake_case) in the output.
 func protoToMap(record *tcv1.PatientRecord) map[string]interface{} {
-	// Serialize with protojson to get the canonical JSON representation
-	b, err := protojson.Marshal(record)
+	b, err := json.Marshal(record)
 	if err != nil {
-		// Fallback: return a minimal error record
 		return map[string]interface{}{
 			"record_id":  record.GetRecordId(),
 			"patient_id": record.GetPatientId(),
 			"_error":     "serialization failed",
 		}
 	}
-
-	// Unmarshal into a generic map for re-encoding as JSONL
 	var m map[string]interface{}
 	json.Unmarshal(b, &m)
 	return m
