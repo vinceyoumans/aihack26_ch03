@@ -1,0 +1,84 @@
+# .github/workflows/destroy.yaml
+# TellCartman Teardown — manually triggered stack destruction.
+#
+# This is a DESTRUCTIVE workflow. It is NOT triggered by push — it only runs
+# when you manually dispatch it from the Actions tab and type the confirmation.
+#
+# How to run:
+#   GitHub → Actions → "Destroy" → Run workflow → type "destroy-dev" to confirm
+#
+# What it does:
+#   1. Empties the data bucket (all object versions + delete markers)
+#   2. Empties the artifacts bucket
+#   3. Deletes the CloudFormation stack (EC2, Lambda, SQS, SNS, CloudFront, S3)
+#   4. Deletes the artifacts bucket (not managed by CloudFormation)
+
+name: Destroy
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "destroy-dev" to confirm teardown of the dev stack'
+        required: true
+        type: string
+
+env:
+  ENV:        "dev"
+  STACK_NAME: "tellcartman-dev"
+
+jobs:
+  destroy:
+    name: Destroy dev stack
+    runs-on: ubuntu-latest
+    environment: aiHack-dev
+    # Guard: only proceed if the confirmation string matches exactly
+    if: ${{ github.event.inputs.confirm == 'destroy-dev' }}
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4.1.0
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Empty data bucket (objects + versions)
+        run: |
+          BUCKET=tellcartman-raw-${{ env.ENV }}-${{ secrets.AWS_ACCOUNT_ID }}
+          echo "Emptying $BUCKET..."
+          aws s3 rm "s3://$BUCKET" --recursive || true
+
+          # Remove all object versions (versioning keeps old ones after s3 rm)
+          aws s3api list-object-versions --bucket "$BUCKET" \
+            --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' --output json 2>/dev/null \
+            | aws s3api delete-objects --bucket "$BUCKET" --delete file:///dev/stdin 2>/dev/null || true
+          # Remove delete markers
+          aws s3api list-object-versions --bucket "$BUCKET" \
+            --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' --output json 2>/dev/null \
+            | aws s3api delete-objects --bucket "$BUCKET" --delete file:///dev/stdin 2>/dev/null || true
+          echo "Data bucket emptied."
+
+      - name: Empty artifacts bucket
+        run: |
+          ART=tc-artifacts-${{ env.ENV }}-${{ secrets.AWS_ACCOUNT_ID }}
+          aws s3 rm "s3://$ART" --recursive || true
+          echo "Artifacts bucket emptied."
+
+      - name: Delete CloudFormation stack
+        run: |
+          echo "Deleting stack ${{ env.STACK_NAME }}..."
+          aws cloudformation delete-stack --stack-name ${{ env.STACK_NAME }}
+          aws cloudformation wait stack-delete-complete --stack-name ${{ env.STACK_NAME }}
+          echo "Stack deleted."
+
+      - name: Delete artifacts bucket
+        run: |
+          ART=tc-artifacts-${{ env.ENV }}-${{ secrets.AWS_ACCOUNT_ID }}
+          aws s3api delete-bucket --bucket "$ART" || true
+          echo "Artifacts bucket deleted."
+
+      - name: Summary
+        run: |
+          echo "✓ Teardown complete — all tellcartman-${{ env.ENV }} resources removed."
+          echo "  Re-deploy any time by pushing to the deploydev branch."
