@@ -10,6 +10,7 @@ package server_test
 import (
 	"context"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,8 +21,8 @@ import (
 
 	"github.com/vinceyoumans/aihack26_ch03/server/internal/server"
 	tcv1 "github.com/vinceyoumans/aihack26_ch03/server/proto/gen"
-	"log/slog"
 	"io"
+	"log/slog"
 	"os"
 )
 
@@ -29,17 +30,29 @@ const bufSize = 1024 * 1024
 
 // ── Mock SQS Publisher ────────────────────────────────────────────────────────
 
+// mockPublisher is safe for concurrent use — the concurrent e2e test calls
+// Publish from multiple goroutines, so we guard the slice with a mutex.
 type mockPublisher struct {
+	mu        sync.Mutex
 	published []*tcv1.PatientRecord
 	err       error
 }
 
 func (m *mockPublisher) Publish(_ context.Context, r *tcv1.PatientRecord) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.err != nil {
 		return m.err
 	}
 	m.published = append(m.published, r)
 	return nil
+}
+
+// count returns the number of published records (thread-safe read).
+func (m *mockPublisher) count() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.published)
 }
 
 // ── Mock S3 Store ─────────────────────────────────────────────────────────────
@@ -120,10 +133,10 @@ func testServer(t *testing.T, pub *mockPublisher, store *mockStore) tcv1.Patient
 // sampleRecord builds a valid PatientRecord for testing.
 func sampleRecord(patientID, recordID string) *tcv1.PatientRecord {
 	return &tcv1.PatientRecord{
-		RecordId:  recordID,
-		PatientId: patientID,
-		SubmittedAt: timestamppb.New(time.Now()),
-		SourceDevice: "go-test",
+		RecordId:      recordID,
+		PatientId:     patientID,
+		SubmittedAt:   timestamppb.New(time.Now()),
+		SourceDevice:  "go-test",
 		SchemaVersion: "1.0.0",
 		BodyStatus: &tcv1.BodyStatus{
 			WeightKg:       72.5,
@@ -137,7 +150,7 @@ func sampleRecord(patientID, recordID string) *tcv1.PatientRecord {
 // ── SubmitRecord Tests ────────────────────────────────────────────────────────
 
 func TestSubmitRecord_Success(t *testing.T) {
-	pub   := &mockPublisher{}
+	pub := &mockPublisher{}
 	store := &mockStore{}
 	client := testServer(t, pub, store)
 
@@ -199,7 +212,7 @@ func TestSubmitRecord_SQSFailure(t *testing.T) {
 // ── StreamAudio Tests ─────────────────────────────────────────────────────────
 
 func TestStreamAudio_Success(t *testing.T) {
-	store  := &mockStore{}
+	store := &mockStore{}
 	client := testServer(t, &mockPublisher{}, store)
 
 	stream, err := client.StreamAudio(context.Background())
@@ -257,7 +270,7 @@ func TestStreamAudio_NoChunks(t *testing.T) {
 // ── RequestPhotoUpload Tests ──────────────────────────────────────────────────
 
 func TestRequestPhotoUpload_Success(t *testing.T) {
-	store  := &mockStore{}
+	store := &mockStore{}
 	client := testServer(t, &mockPublisher{}, store)
 
 	resp, err := client.RequestPhotoUpload(context.Background(), &tcv1.PhotoUploadRequest{
@@ -287,7 +300,7 @@ func TestRequestPhotoUpload_InvalidPhotoType(t *testing.T) {
 	_, err := client.RequestPhotoUpload(context.Background(), &tcv1.PhotoUploadRequest{
 		PatientId: "pt-001",
 		RecordId:  "rec-001",
-		PhotoType: "selfie",   // invalid
+		PhotoType: "selfie", // invalid
 		MimeType:  "image/jpeg",
 	})
 

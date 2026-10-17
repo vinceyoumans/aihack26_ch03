@@ -48,18 +48,18 @@ func main() {
 	slog.SetDefault(logger)
 
 	// ── Config from environment ──────────────────────────────────────────────
-	grpcPort   := getenv("GRPC_PORT",   "50051")
+	grpcPort := getenv("GRPC_PORT", "50051")
 	healthPort := getenv("HEALTH_PORT", "8080")
-	queueURL   := mustenv("QUEUE_URL")
+	queueURL := mustenv("QUEUE_URL")
 	bucketName := mustenv("BUCKET_NAME")
-	region     := getenv("AWS_REGION", "us-east-1")
-	env        := getenv("ENV", "dev")
+	region := getenv("AWS_REGION", "us-east-1")
+	env := getenv("ENV", "dev")
 
 	slog.Info("starting tc-server",
-		"grpc_port",   grpcPort,
+		"grpc_port", grpcPort,
 		"health_port", healthPort,
-		"env",         env,
-		"region",      region,
+		"env", env,
+		"region", region,
 	)
 
 	// ── AWS SDK clients ──────────────────────────────────────────────────────
@@ -73,12 +73,12 @@ func main() {
 	}
 
 	sqsClient := awssqs.NewFromConfig(awsCfg)
-	s3Client  := awss3.NewFromConfig(awsCfg)
+	s3Client := awss3.NewFromConfig(awsCfg)
 
 	// ── Service dependencies ─────────────────────────────────────────────────
 	publisher := queue.NewPublisher(sqsClient, queueURL)
-	store     := storage.NewStore(s3Client, bucketName)
-	handler   := server.NewHandler(publisher, store, logger)
+	store := storage.NewStore(s3Client, bucketName)
+	handler := server.NewHandler(publisher, store, logger)
 
 	// ── gRPC server ──────────────────────────────────────────────────────────
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", grpcPort))

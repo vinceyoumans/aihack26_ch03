@@ -38,11 +38,11 @@ func NewStore(client *s3.Client, bucketName string) *Store {
 // Used by the StreamAudio handler to save reassembled audio clips.
 func (s *Store) PutObject(ctx context.Context, key, contentType string, data []byte) error {
 	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:               aws.String(s.bucketName),
-		Key:                  aws.String(key),
-		Body:                 bytes.NewReader(data),
-		ContentType:          aws.String(contentType),
-		ContentLength:        aws.Int64(int64(len(data))),
+		Bucket:        aws.String(s.bucketName),
+		Key:           aws.String(key),
+		Body:          bytes.NewReader(data),
+		ContentType:   aws.String(contentType),
+		ContentLength: aws.Int64(int64(len(data))),
 		// Server-side encryption — the bucket policy enforces this but
 		// specifying it here makes the intent explicit
 		ServerSideEncryption: types.ServerSideEncryptionAes256,

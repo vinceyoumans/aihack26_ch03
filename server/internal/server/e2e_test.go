@@ -26,7 +26,7 @@ import (
 //
 // This mirrors what the Go CSV client does: read rows, call SubmitRecord.
 func TestE2E_PushRecords(t *testing.T) {
-	pub   := &mockPublisher{}
+	pub := &mockPublisher{}
 	store := &mockStore{}
 	client := testServer(t, pub, store)
 
@@ -83,7 +83,7 @@ func TestE2E_PushRecords(t *testing.T) {
 // TestE2E_PushRecordsConcurrent verifies the server handles concurrent
 // submissions without data races (verified by -race flag in CI).
 func TestE2E_PushRecordsConcurrent(t *testing.T) {
-	pub   := &mockPublisher{}
+	pub := &mockPublisher{}
 	store := &mockStore{}
 	client := testServer(t, pub, store)
 
@@ -102,10 +102,10 @@ func TestE2E_PushRecordsConcurrent(t *testing.T) {
 			ctx := context.Background()
 			for i := 0; i < recsEach; i++ {
 				rec := &tcv1.PatientRecord{
-					RecordId:    fmt.Sprintf("w%d-rec-%03d", workerID, i),
-					PatientId:   fmt.Sprintf("pt-%03d", workerID),
-					SubmittedAt: timestamppb.New(time.Now()),
-					SourceDevice: "concurrent-test",
+					RecordId:      fmt.Sprintf("w%d-rec-%03d", workerID, i),
+					PatientId:     fmt.Sprintf("pt-%03d", workerID),
+					SubmittedAt:   timestamppb.New(time.Now()),
+					SourceDevice:  "concurrent-test",
 					SchemaVersion: "1.0.0",
 				}
 				if _, err := client.SubmitRecord(ctx, rec); err != nil {
@@ -123,22 +123,22 @@ func TestE2E_PushRecordsConcurrent(t *testing.T) {
 	}
 
 	expected := numWorkers * recsEach
-	if len(pub.published) != expected {
-		t.Errorf("expected %d total records in SQS, got %d", expected, len(pub.published))
+	if pub.count() != expected {
+		t.Errorf("expected %d total records in SQS, got %d", expected, pub.count())
 	}
 }
 
 // TestE2E_AudioThenRecord simulates the full media + record flow:
-//   1. Stream audio → get S3 key
-//   2. Request presigned URL for photo → get S3 key
-//   3. Submit PatientRecord with both keys attached
+//  1. Stream audio → get S3 key
+//  2. Request presigned URL for photo → get S3 key
+//  3. Submit PatientRecord with both keys attached
 func TestE2E_AudioThenRecord(t *testing.T) {
-	pub   := &mockPublisher{}
+	pub := &mockPublisher{}
 	store := &mockStore{}
 	client := testServer(t, pub, store)
-	ctx   := context.Background()
+	ctx := context.Background()
 
-	recordID  := "e2e-media-001"
+	recordID := "e2e-media-001"
 	patientID := "pt-media"
 
 	// Step 1: Stream a fake 20-second audio clip (600 bytes, 3 × 200-byte chunks)
@@ -187,10 +187,10 @@ func TestE2E_AudioThenRecord(t *testing.T) {
 		SourceDevice:  "e2e-test",
 		SchemaVersion: "1.0.0",
 		BodyStatus: &tcv1.BodyStatus{
-			WeightKg:        71.5,
-			GeneralFeeling:  8,
-			PhotoFaceS3Key:  photoS3Key,
-			RecordedAt:      timestamppb.New(time.Now()),
+			WeightKg:       71.5,
+			GeneralFeeling: 8,
+			PhotoFaceS3Key: photoS3Key,
+			RecordedAt:     timestamppb.New(time.Now()),
 		},
 		StressorEvents: []*tcv1.StressorEvent{
 			{
@@ -250,10 +250,10 @@ func TestE2E_CSVSimulation(t *testing.T) {
 		{"pt-002", 84.9, 5, 34.0522, -118.2437},
 	}
 
-	pub    := &mockPublisher{}
-	store  := &mockStore{}
+	pub := &mockPublisher{}
+	store := &mockStore{}
 	client := testServer(t, pub, store)
-	ctx    := context.Background()
+	ctx := context.Background()
 
 	for i, row := range rows {
 		rec := &tcv1.PatientRecord{

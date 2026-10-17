@@ -10,6 +10,7 @@ package writer_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"strings"
 	"testing"
@@ -17,12 +18,11 @@ import (
 
 	"github.com/aws/aws-lambda-go/events"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
-	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"log/slog"
 
-	tcv1 "github.com/vinceyoumans/aihack26_ch03/server/proto/gen"
 	"github.com/vinceyoumans/aihack26_ch03/server/lambda/writer"
+	tcv1 "github.com/vinceyoumans/aihack26_ch03/server/proto/gen"
 )
 
 // ── Mock S3 Client ────────────────────────────────────────────────────────────
@@ -59,7 +59,7 @@ func makeHandler(s3 *mockS3) *writer.Handler {
 }
 
 func recordToSQSMessage(id string, record *tcv1.PatientRecord) events.SQSMessage {
-	body, _ := protojson.Marshal(record)
+	body, _ := json.Marshal(record)
 	return events.SQSMessage{
 		MessageId: id,
 		Body:      string(body),
@@ -81,8 +81,8 @@ func sampleRecord(patientID, recordID string) *tcv1.PatientRecord {
 // TestHandleRequest_WritesJSONL verifies that a batch of SQS messages
 // is assembled into a JSONL file and written to S3 under the raw/ prefix.
 func TestHandleRequest_WritesJSONL(t *testing.T) {
-	s3   := &mockS3{}
-	h    := makeHandler(s3)
+	s3 := &mockS3{}
+	h := makeHandler(s3)
 
 	event := events.SQSEvent{
 		Records: []events.SQSMessage{
@@ -136,7 +136,7 @@ func TestHandleRequest_WritesJSONL(t *testing.T) {
 // is reported as a batch item failure and does not block other records.
 func TestHandleRequest_MalformedMessage(t *testing.T) {
 	s3 := &mockS3{}
-	h  := makeHandler(s3)
+	h := makeHandler(s3)
 
 	event := events.SQSEvent{
 		Records: []events.SQSMessage{
@@ -173,7 +173,7 @@ func TestHandleRequest_MalformedMessage(t *testing.T) {
 // does not call S3 at all.
 func TestHandleRequest_EmptyBatch(t *testing.T) {
 	s3 := &mockS3{}
-	h  := makeHandler(s3)
+	h := makeHandler(s3)
 
 	resp, err := h.HandleRequest(context.Background(), events.SQSEvent{})
 	if err != nil {
@@ -191,7 +191,7 @@ func TestHandleRequest_EmptyBatch(t *testing.T) {
 // the function returns an error so SQS retries the entire batch.
 func TestHandleRequest_S3Failure(t *testing.T) {
 	s3 := &mockS3{putErr: io.ErrUnexpectedEOF}
-	h  := makeHandler(s3)
+	h := makeHandler(s3)
 
 	event := events.SQSEvent{
 		Records: []events.SQSMessage{
@@ -210,7 +210,7 @@ func TestHandleRequest_S3Failure(t *testing.T) {
 func TestBuildS3Key(t *testing.T) {
 	// Use the exported BuildS3KeyForTest if available, otherwise verify via handler
 	s3 := &mockS3{}
-	h  := makeHandler(s3)
+	h := makeHandler(s3)
 
 	event := events.SQSEvent{
 		Records: []events.SQSMessage{

@@ -18,8 +18,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/vinceyoumans/aihack26_ch03/server/internal/queue"
-	"github.com/vinceyoumans/aihack26_ch03/server/internal/storage"
 	tcv1 "github.com/vinceyoumans/aihack26_ch03/server/proto/gen"
 )
 
@@ -27,13 +25,13 @@ import (
 // It is stateless — all state flows to SQS and S3.
 type Handler struct {
 	tcv1.UnimplementedPatientDataServiceServer
-	publisher *queue.Publisher
-	store     *storage.Store
+	publisher MessagePublisher
+	store     ObjectStore
 	logger    *slog.Logger
 }
 
 // NewHandler creates a new Handler with the given dependencies.
-func NewHandler(publisher *queue.Publisher, store *storage.Store, logger *slog.Logger) *Handler {
+func NewHandler(publisher MessagePublisher, store ObjectStore, logger *slog.Logger) *Handler {
 	return &Handler{
 		publisher: publisher,
 		store:     store,
@@ -74,9 +72,9 @@ func (h *Handler) SubmitRecord(
 	}
 
 	h.logger.InfoContext(ctx, "record accepted",
-		"record_id",  req.GetRecordId(),
+		"record_id", req.GetRecordId(),
 		"patient_id", req.GetPatientId(),
-		"source",     req.GetSourceDevice(),
+		"source", req.GetSourceDevice(),
 	)
 
 	return &tcv1.SubmitRecordResponse{
@@ -111,7 +109,7 @@ func (h *Handler) StreamAudio(stream tcv1.PatientDataService_StreamAudioServer) 
 
 		// Capture IDs from the first chunk
 		if recordID == "" {
-			recordID  = chunk.GetRecordId()
+			recordID = chunk.GetRecordId()
 			patientID = chunk.GetPatientId()
 		}
 
@@ -134,19 +132,19 @@ func (h *Handler) StreamAudio(stream tcv1.PatientDataService_StreamAudioServer) 
 
 	if err := h.store.PutObject(ctx, s3Key, mimeType, audioData); err != nil {
 		h.logger.ErrorContext(ctx, "failed to upload audio to S3",
-			"record_id",  recordID,
+			"record_id", recordID,
 			"patient_id", patientID,
-			"error",       err,
+			"error", err,
 		)
 		return status.Errorf(codes.Internal, "S3 upload failed: %v", err)
 	}
 
 	h.logger.InfoContext(ctx, "audio uploaded",
-		"record_id",   recordID,
-		"patient_id",  patientID,
-		"s3_key",      s3Key,
-		"size_bytes",  len(audioData),
-		"num_chunks",  assembler.chunkCount(),
+		"record_id", recordID,
+		"patient_id", patientID,
+		"s3_key", s3Key,
+		"size_bytes", len(audioData),
+		"num_chunks", assembler.chunkCount(),
 	)
 
 	return stream.SendAndClose(&tcv1.AudioUploadResponse{
@@ -196,16 +194,16 @@ func (h *Handler) RequestPhotoUpload(
 	if err != nil {
 		h.logger.ErrorContext(ctx, "failed to generate presigned URL",
 			"s3_key", s3Key,
-			"error",  err,
+			"error", err,
 		)
 		return nil, status.Errorf(codes.Internal, "presign failed: %v", err)
 	}
 
 	h.logger.InfoContext(ctx, "presigned URL generated",
 		"patient_id", req.GetPatientId(),
-		"record_id",  req.GetRecordId(),
+		"record_id", req.GetRecordId(),
 		"photo_type", req.GetPhotoType(),
-		"s3_key",     s3Key,
+		"s3_key", s3Key,
 	)
 
 	return &tcv1.PhotoUploadResponse{

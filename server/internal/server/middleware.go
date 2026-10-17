@@ -36,8 +36,8 @@ func LoggingUnaryInterceptor(logger *slog.Logger) grpc.UnaryServerInterceptor {
 		}
 
 		logger.InfoContext(ctx, "rpc",
-			"method",     info.FullMethod,
-			"code",       code.String(),
+			"method", info.FullMethod,
+			"code", code.String(),
 			"latency_ms", latency.Milliseconds(),
 		)
 
@@ -63,8 +63,8 @@ func LoggingStreamInterceptor(logger *slog.Logger) grpc.StreamServerInterceptor 
 		}
 
 		logger.Info("rpc_stream",
-			"method",     info.FullMethod,
-			"code",       code.String(),
+			"method", info.FullMethod,
+			"code", code.String(),
 			"latency_ms", latency.Milliseconds(),
 		)
 		return err

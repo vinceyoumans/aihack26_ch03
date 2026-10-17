@@ -16,10 +16,10 @@ import (
 // audioAssembler collects audio chunks and reassembles them.
 // It validates chunk ordering and guards against oversized payloads.
 type audioAssembler struct {
-	buf        bytes.Buffer
-	nextIndex  int32
-	mimeType   string
-	numChunks  int
+	buf       bytes.Buffer
+	nextIndex int32
+	mimeType  string
+	numChunks int
 }
 
 const maxAudioBytes = 5 * 1024 * 1024 // 5MB max — a 20s Opus clip is ~300KB
