@@ -1,7 +1,0 @@
-[
-  { "ParameterKey": "Env",                "ParameterValue": "dev" },
-  { "ParameterKey": "AllowedGrpcCidr",    "ParameterValue": "0.0.0.0/0" },
-  { "ParameterKey": "LambdaS3BucketParam","ParameterValue": "REPLACE_WITH_YOUR_BUCKET" },
-  { "ParameterKey": "LambdaS3KeyParam",   "ParameterValue": "binaries/lambda-writer.zip" },
-  { "ParameterKey": "AlertEmail",         "ParameterValue": "" }
-]

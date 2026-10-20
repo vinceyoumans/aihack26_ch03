@@ -1,0 +1,28 @@
+# ── OS ────────────────────────────────────────────────
+.DS_Store
+
+# ── Go ────────────────────────────────────────────────
+/bin/
+*.exe
+*.test
+*.out
+coverage.*
+# keep go.sum; ignore local build caches
+vendor/
+
+# ── Rust ──────────────────────────────────────────────
+/target/
+**/*.rs.bk
+Cargo.lock.orig
+
+# ── AWS / secrets ─────────────────────────────────────
+.env
+*.pem
+*.key
+aws-credentials*
+.aws/
+
+# ── Editor / tooling ──────────────────────────────────
+.idea/
+.vscode/
+*.swp
